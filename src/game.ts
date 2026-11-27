@@ -12,6 +12,7 @@ import { Vfx } from "./vfx";
 import { articleFor, type Article } from "./content";
 import { SCULPTURES, WINGS, type PieceSpec, type SculptureDef, type WingInfo } from "./sculptures";
 import { DRESSING, buildWorld, type BuiltWorld } from "./world";
+import { campusProps, type PropSpec } from "./props";
 import { publicUrl } from "./public-url";
 
 type Quality = "high" | "balanced" | "swift";
@@ -48,16 +49,54 @@ interface Field {
   z: number;
   age: number;
   boomed: boolean;
+  dropped: boolean;
   group: THREE.Group;
   light: THREE.PointLight;
+  affected: Array<{ body: RAPIER.RigidBody; gravity: number }>;
+}
+
+interface LiveProp {
+  spec: PropSpec;
+  mesh: THREE.Mesh;
+  body: RAPIER.RigidBody;
+  collider: RAPIER.Collider;
+  pivot: RAPIER.RigidBody | null;
+  joint: RAPIER.ImpulseJoint | null;
+  light: THREE.PointLight | null;
+  fragile: boolean;
+  core: boolean;
+  shard: boolean;
+  alive: boolean;
+  spent: boolean;
+  removed: boolean;
+  fuse: number;
+  family: "glass" | "metal" | "stone" | "wood";
+  gravityScale: number;
+  nextClack: number;
+}
+
+interface Missile {
+  mesh: THREE.Mesh;
+  body: RAPIER.RigidBody;
+  collider: RAPIER.Collider;
+  kind: "meteor" | "orb";
+  exploded: boolean;
+  life: number;
+  removed: boolean;
+}
+
+interface Actor {
+  body: RAPIER.RigidBody;
+  piece?: Piece;
+  prop?: LiveProp;
 }
 
 const POWERS: Record<PowerId, { name: string; line: string; cd: number }> = {
-  1: { name: "Kinetic Lance", line: "A clean question, asked at speed.", cd: 0.38 },
-  2: { name: "Gravity Singularity", line: "Gather what was separate. Then let it go.", cd: 3.4 },
-  3: { name: "Seismic Shockwave", line: "The terrace remembers it is also ground.", cd: 2.15 },
-  4: { name: "Solar Ember Beam", line: "Heat, patiently, until the form changes its mind.", cd: 0 },
-  5: { name: "Differentiality Pulse", line: "z = 1/E. Gravity, briefly persuaded otherwise.", cd: 3.1 },
+  1: { name: "Kinetic Force Blast", line: "A directional shock. The room is asked to move.", cd: 0.42 },
+  2: { name: "Singularity", line: "A gravity well. Orbit, then the fling.", cd: 3.1 },
+  3: { name: "Differentiality Inversion", line: "z = 1/E. Nearby mass forgets which way is down.", cd: 2.8 },
+  4: { name: "Fracture Beam", line: "The form was a suggestion. Shards remember otherwise.", cd: 0.28 },
+  5: { name: "Orbital Slam", line: "A meteor with the campus’s full attention.", cd: 2.4 },
 };
 
 const LOOK = { exposure: 0.58, sun: 4.4, env: 1.05, hemi: 0.95, fog: 0.0018 };
@@ -113,6 +152,25 @@ export class Game {
   private travelLock = false;
   private aimed: string | null = null;
   private passThrough = new Set<number>();
+  private props: LiveProp[] = [];
+  private propByHandle = new Map<number, LiveProp>();
+  private missiles: Missile[] = [];
+  private missileByHandle = new Map<number, Missile>();
+  private afterStep: Array<() => void> = [];
+  private physAcc = 0;
+  private velX = 0;
+  private velZ = 0;
+  private stuck = 0;
+  private jumpQueued = 0;
+  private timeScale = 1;
+  private lowG = false;
+  private slow = false;
+  private kicks = 0;
+  private destroyed = 0;
+  private clickArmed = false;
+  private beamHold = 0;
+  private shardCount = 0;
+  private physSteps = 0;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -226,17 +284,28 @@ export class Game {
     this.scene.add(this.beam);
 
     const player = this.world.createRigidBody(
-      RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, 1.4, 12.4),
+      RAPIER.RigidBodyDesc.kinematicPositionBased()
+        .setTranslation(0, 2.35, 12.4)
+        .setCanSleep(false)
+        .lockRotations()
+        .setCcdEnabled(true),
     );
-    this.playerCollider = this.world.createCollider(RAPIER.ColliderDesc.capsule(0.58, 0.3), player);
+    this.playerCollider = this.world.createCollider(
+      RAPIER.ColliderDesc.capsule(0.5, 0.28).setFriction(0.02).setRestitution(0),
+      player,
+    );
     this.playerBody = player;
-    this.controller = this.world.createCharacterController(0.02);
+    this.playerBody.setEnabled(true);
+    this.controller = this.world.createCharacterController(0.01);
     this.controller.setUp({ x: 0, y: 1, z: 0 });
-    this.controller.enableAutostep(0.42, 0.18, true);
-    this.controller.enableSnapToGround(0.3);
-    this.controller.setMaxSlopeClimbAngle(Math.PI / 4);
+    this.controller.enableAutostep(0.48, 0.22, false);
+    this.controller.enableSnapToGround(0.5);
+    this.controller.setMaxSlopeClimbAngle(Math.PI * 0.3);
+    this.controller.setMinSlopeSlideAngle(Math.PI * 0.36);
     this.controller.setSlideEnabled(true);
     this.controller.setApplyImpulsesToDynamicBodies(true);
+    this.controller.setCharacterMass(85);
+    this.rebuildProps();
 
     const renderPass = new RenderPass(this.scene, this.camera);
     this.bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.38, 0.42, 0.86);
@@ -350,7 +419,9 @@ export class Game {
     gem.position.y = 0.48;
     gem.userData.bob = id.length;
     face.userData.read = id;
+    face.userData.plaque = true;
     stone.userData.read = id;
+    stone.userData.plaque = true;
     group.add(post, stone, face, gem);
     group.position.set(x, 1.2, z);
     group.rotation.y = yaw;
@@ -494,8 +565,8 @@ export class Game {
     document.getElementById("touch-read")?.addEventListener("click", () => this.readAimed());
     document.getElementById("touch-look")?.addEventListener("click", () => this.toggleLook());
 
-    window.addEventListener("keydown", (e) => this.onKey(e, true));
-    window.addEventListener("keyup", (e) => this.onKey(e, false));
+    window.addEventListener("keydown", (e) => this.onKey(e, true), true);
+    window.addEventListener("keyup", (e) => this.onKey(e, false), true);
     this.canvas.addEventListener("contextmenu", (e) => e.preventDefault());
     this.canvas.addEventListener("pointerdown", (e) => this.onPointerDown(e));
     this.canvas.addEventListener("pointerup", (e) => this.onPointerUp(e));
@@ -510,40 +581,62 @@ export class Game {
     this.setPower(1);
   }
 
+  private eventCode(e: KeyboardEvent): string {
+    if (e.code && e.code !== "Unidentified") return e.code;
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    const map: Record<string, string> = {
+      w: "KeyW", a: "KeyA", s: "KeyS", d: "KeyD",
+      q: "KeyQ", e: "KeyE", f: "KeyF", g: "KeyG", t: "KeyT", r: "KeyR",
+      c: "KeyC", m: "KeyM", x: "KeyX",
+      " ": "Space",
+      arrowup: "ArrowUp", arrowdown: "ArrowDown", arrowleft: "ArrowLeft", arrowright: "ArrowRight",
+      shift: "ShiftLeft", escape: "Escape", enter: "Enter",
+      "1": "Digit1", "2": "Digit2", "3": "Digit3", "4": "Digit4", "5": "Digit5",
+    };
+    return map[key] ?? map[e.key] ?? e.key;
+  }
+
   private onKey(e: KeyboardEvent, down: boolean): void {
-    const tag = (e.target as HTMLElement | null)?.tagName;
+    const target = e.target as HTMLElement | null;
+    const tag = target?.tagName;
+    if (this.mode === "play" && tag === "BUTTON") target?.blur();
     if (tag === "INPUT" || tag === "TEXTAREA") return;
-    if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
-    if (down) this.keys.add(e.code);
-    else this.keys.delete(e.code);
+    const code = this.eventCode(e);
+    if (this.mode === "play" && (code === "Space" || code.startsWith("Arrow"))) e.preventDefault();
+    if (down) this.keys.add(code);
+    else this.keys.delete(code);
     if (!down) {
-      if (e.code === "KeyF") this.solarDown = false;
+      if (code === "KeyF") this.solarDown = false;
       return;
     }
-    if (this.mode === "cine" && (e.code === "Enter" || e.code === "Space")) {
+    if (this.mode === "cine" && (code === "Enter" || code === "Space")) {
+      e.preventDefault();
       void this.audio.resume();
       this.beginPlay(false);
       return;
     }
-    if (e.code === "Escape") this.closePanels();
-    if (readerOpen() || helpOpen()) return;
-    if (e.code >= "Digit1" && e.code <= "Digit5") this.setPower(Number(e.code.slice(5)) as PowerId);
-    if (e.code === "KeyE") this.readAimed();
-    if (e.code === "KeyR") {
-      if (e.shiftKey) this.restoreAll();
+    if (code === "Escape") {
+      this.closePanels();
+      if (document.pointerLockElement) document.exitPointerLock();
+      return;
+    }
+    if (readerOpen() || helpOpen() || creditsOpen()) return;
+    if (code >= "Digit1" && code <= "Digit5" && !e.repeat) this.setPower(Number(code.slice(5)) as PowerId);
+    if (code === "KeyX" && !e.repeat) this.readAimed();
+    if (code === "KeyR" && !e.repeat) {
+      if (e.shiftKey || e.getModifierState("Shift")) this.restoreAll();
       else this.restoreAimed();
     }
-    if (e.code === "KeyC") this.toggleLook();
-    if (e.code === "KeyM") {
+    if (code === "KeyC" && !e.repeat) this.toggleLook();
+    if (code === "KeyM" && !e.repeat) {
       this.audio.setMuted(!this.audio.muted);
       const btn = document.getElementById("btn-sound");
       if (btn) btn.textContent = this.audio.muted ? "Muted" : "Sound";
     }
-    if (e.code === "KeyF" && !e.repeat) {
-      this.fireEdge = true;
-      this.solarDown = true;
-    }
-    if (e.code === "Space") this.keys.add("Space");
+    if (code === "KeyF" && !e.repeat && this.mode === "play") this.launchOrb();
+    if (code === "KeyG" && !e.repeat && this.mode === "play") this.toggleLowG();
+    if (code === "KeyT" && !e.repeat && this.mode === "play") this.toggleSlow();
+    if (code === "Space" && !e.repeat && this.mode === "play") this.jumpQueued = 0.18;
   }
 
   private onPointerDown(e: PointerEvent): void {
@@ -556,14 +649,13 @@ export class Game {
       return;
     }
     if (e.button !== 0 || this.mode !== "play") return;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== this.canvas) active.blur();
     if (document.pointerLockElement === this.canvas) {
       this.fireEdge = true;
       this.solarDown = true;
-      const up = () => {
-        this.solarDown = false;
-        window.removeEventListener("pointerup", up);
-      };
-      window.addEventListener("pointerup", up);
+    } else {
+      this.clickArmed = true;
     }
   }
 
@@ -574,12 +666,12 @@ export class Game {
     this.pointer.y = e.clientY;
     if (Math.hypot(dx, dy) > 2) this.pointer.moved = true;
     const locked = document.pointerLockElement === this.canvas;
-    const coarse = window.matchMedia("(pointer: coarse)").matches;
+    const dragging = this.rightDown || (e.buttons & 1) === 1 || (e.buttons & 2) === 2;
     if (locked) {
       this.yaw -= e.movementX * 0.00215;
-      this.pitch -= e.movementY * 0.00215;
-    } else if (this.rightDown || (coarse && (e.buttons & 1) === 1 && this.pointer.moved)) {
-      this.yaw -= dx * 0.0045;
+      this.pitch -= e.movementY * 0.0019;
+    } else if (dragging && this.mode === "play") {
+      this.yaw -= dx * 0.0046;
       this.pitch -= dy * 0.004;
     }
     this.pitch = Math.max(-1.25, Math.min(1.25, this.pitch));
@@ -588,12 +680,23 @@ export class Game {
   private beginPlay(lock: boolean): void {
     this.mode = "play";
     document.getElementById("intro")?.classList.add("hide");
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) active.blur();
+    this.canvas.focus({ preventScroll: true });
     const wing = WINGS[0];
     this.yaw = wing.yaw;
     this.pitch = -0.08;
-    this.playerBody.setTranslation({ x: wing.x, y: 1.35, z: wing.z }, true);
-    this.playerBody.setNextKinematicTranslation({ x: wing.x, y: 1.35, z: wing.z });
-    if (lock) this.canvas.requestPointerLock();
+    this.velX = 0;
+    this.velZ = 0;
+    this.vy = 0;
+    this.stuck = 0;
+    this.jumpQueued = 0;
+    this.placePlayer(wing.x, wing.z);
+    document.getElementById("crosshair")?.classList.add("show");
+    if (lock) {
+      const req = this.canvas.requestPointerLock();
+      void Promise.resolve(req).catch(() => undefined);
+    }
   }
 
   private toggleLook(): void {
@@ -612,8 +715,9 @@ export class Game {
       this.vy = 0;
       this.stroll = null;
       this.marker.visible = false;
-      this.playerBody.setTranslation({ x: wing.x, y: 1.4, z: wing.z }, true);
-      this.playerBody.setNextKinematicTranslation({ x: wing.x, y: 1.4, z: wing.z });
+      this.velX = 0;
+      this.velZ = 0;
+      this.placePlayer(wing.x, wing.z);
       this.audio.whoosh();
       fade?.classList.remove("on");
       this.travelLock = false;
@@ -635,14 +739,16 @@ export class Game {
   }
 
   private frame(): void {
-    const dt = Math.min(0.033, this.clock.getDelta());
-    this.time += dt;
+    const dt = Math.min(0.25, this.clock.getDelta());
+    const sim = dt * this.timeScale;
+    this.time += sim;
     this.fpsSmoothed = this.fpsSmoothed * 0.92 + (1 / Math.max(dt, 0.001)) * 0.08;
     this.fpsAcc += dt;
     if (this.fpsAcc > 0.3) {
       this.fpsAcc = 0;
       const fps = document.getElementById("fps");
       if (fps) fps.textContent = `${Math.round(this.fpsSmoothed)} fps`;
+      this.paintSandbox();
     }
     if (this.mode === "cine") {
       const t = this.time * (this.reduceMotion ? 0.015 : 0.06);
@@ -654,15 +760,18 @@ export class Game {
     } else {
       this.stepPlayerLook(dt);
     }
-    this.stepPhysics(dt);
+    this.stepPhysics(sim);
+    this.flushAfterStep();
     this.syncMeshes();
-    this.updateFields(dt);
-    this.updateHeat(dt);
+    this.updateFuses(sim);
+    this.flushAfterStep();
+    this.updateFields(sim);
     this.updateAim();
-    this.updatePowers(dt);
-    this.vfx.update(dt);
+    this.updatePowers(sim);
+    this.vfx.update(sim);
     this.audio.update(dt);
-    this.decor(dt);
+    this.decor(sim);
+    this.paintProbe();
     if (this.mode === "play") this.placeCamera();
     for (const id of [1, 2, 3, 4, 5] as PowerId[]) this.cd[id] = Math.max(0, this.cd[id] - dt);
     this.paintCooldowns();
@@ -671,36 +780,50 @@ export class Game {
   }
 
   private stepPlayerLook(dt: number): void {
-    const turn = 1.7 * dt;
-    if (this.keys.has("ArrowLeft")) this.yaw += turn;
-    if (this.keys.has("ArrowRight")) this.yaw -= turn;
-    if (this.keys.has("ArrowUp")) this.pitch += turn * 0.8;
-    if (this.keys.has("ArrowDown")) this.pitch -= turn * 0.8;
-    this.pitch = Math.max(-1.25, Math.min(1.25, this.pitch));
+    const turn = 1.85 * dt;
+    if (this.keys.has("KeyQ")) this.yaw += turn;
+    if (this.keys.has("KeyE")) this.yaw -= turn;
+    this.pitch = Math.max(-1.2, Math.min(1.15, this.pitch));
   }
 
   private stepPhysics(dt: number): void {
-    let acc = dt;
+    this.physAcc += dt;
     const step = 1 / 60;
     let n = 0;
-    while (acc >= step && n < 3) {
+    while (this.physAcc >= step && n < 15) {
       if (this.mode === "play") this.movePlayer(step);
       this.orbitPieces(step);
+      this.world.timestep = step;
       this.world.step(this.queue);
       this.drainContacts();
-      acc -= step;
+      this.physAcc -= step;
+      this.physSteps++;
       n++;
     }
+    if (n === 15) this.physAcc = 0;
+  }
+
+  private placePlayer(x: number, z: number): void {
+    const y = 2.35;
+    this.playerBody.setEnabled(true);
+    this.playerBody.wakeUp();
+    this.playerBody.setTranslation({ x, y, z }, true);
+    this.playerBody.setNextKinematicTranslation({ x, y, z });
+    this.playerBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    this.vy = 0;
+    this.grounded = false;
+    this.stuck = 0;
   }
 
   private movePlayer(dt: number): void {
     const p = this.playerBody.translation();
+    if (p.y < 0.35) this.placePlayer(p.x, p.z);
     let forward = 0;
     let strafe = 0;
-    if (this.keys.has("KeyW")) forward += 1;
-    if (this.keys.has("KeyS")) forward -= 1;
-    if (this.keys.has("KeyD")) strafe += 1;
-    if (this.keys.has("KeyA")) strafe -= 1;
+    if (this.keys.has("KeyW") || this.keys.has("ArrowUp")) forward += 1;
+    if (this.keys.has("KeyS") || this.keys.has("ArrowDown")) forward -= 1;
+    if (this.keys.has("KeyD") || this.keys.has("ArrowRight")) strafe += 1;
+    if (this.keys.has("KeyA") || this.keys.has("ArrowLeft")) strafe -= 1;
     const fx = -Math.sin(this.yaw);
     const fz = -Math.cos(this.yaw);
     const rx = Math.cos(this.yaw);
@@ -710,9 +833,10 @@ export class Game {
     const mag = Math.hypot(wx, wz);
     if (mag > 0) { wx /= mag; wz /= mag; }
     const typing = forward !== 0 || strafe !== 0;
+    const here = this.playerBody.translation();
     if (!typing && this.stroll) {
-      const dx = this.stroll.x - p.x;
-      const dz = this.stroll.z - p.z;
+      const dx = this.stroll.x - here.x;
+      const dz = this.stroll.z - here.z;
       const d = Math.hypot(dx, dz);
       if (d < 0.55) {
         this.stroll = null;
@@ -720,32 +844,53 @@ export class Game {
       } else {
         wx = dx / d;
         wz = dz / d;
-        if (document.pointerLockElement !== this.canvas && !this.rightDown) {
-          this.yaw = Math.atan2(-wx, -wz);
-        }
       }
     }
+    const moving = typing || this.stroll !== null;
     const sprint = this.keys.has("ShiftLeft") || this.keys.has("ShiftRight");
-    const speed = (sprint ? 10.4 : 5.5) * (mag > 0 || this.stroll ? 1 : 0);
-    if (this.grounded && this.vy <= 0) this.vy = 0;
-    else this.vy -= 18 * dt;
-    if (this.grounded) this.coyote = 0.12;
-    else this.coyote = Math.max(0, this.coyote - dt);
-    if (this.keys.has("Space") && (this.grounded || this.coyote > 0)) {
-      this.vy = 6.5;
-      this.coyote = 0;
-      this.keys.delete("Space");
+    const max = (sprint ? 11.4 : 6.5) * (moving ? 1 : 0);
+    const rate = (moving ? 16 : 22) * dt;
+    const blend = 1 - Math.exp(-rate);
+    this.velX += (wx * max - this.velX) * blend;
+    this.velZ += (wz * max - this.velZ) * blend;
+    if (!moving && Math.hypot(this.velX, this.velZ) < 0.05) {
+      this.velX = 0;
+      this.velZ = 0;
     }
-    this.controller.computeColliderMovement(
-      this.playerCollider,
-      { x: wx * speed * dt, y: this.vy * dt, z: wz * speed * dt },
-    );
+    const gravity = this.lowG ? 3.6 : 21;
+    if (this.grounded && this.vy <= 0) this.vy = 0;
+    else this.vy -= gravity * dt;
+    this.vy = Math.max(-28, this.vy);
+    if (this.grounded) this.coyote = 0.14;
+    else this.coyote = Math.max(0, this.coyote - dt);
+    if (this.jumpQueued > 0) {
+      this.jumpQueued -= dt;
+      if (this.grounded || this.coyote > 0) {
+        this.vy = this.lowG ? 5.6 : 7.7;
+        this.grounded = false;
+        this.coyote = 0;
+        this.jumpQueued = 0;
+      }
+    }
+    this.controller.computeColliderMovement(this.playerCollider, {
+      x: this.velX * dt,
+      y: this.vy * dt,
+      z: this.velZ * dt,
+    });
     const m = this.controller.computedMovement();
-    const next = { x: p.x + m.x, y: p.y + m.y, z: p.z + m.z };
+    const next = { x: here.x + m.x, y: here.y + m.y, z: here.z + m.z };
+    const horiz = Math.hypot(m.x, m.z);
+    if (moving && horiz < 0.0015) {
+      this.stuck += 1;
+      if (this.stuck === 8 || this.stuck === 16) {
+        next.y += 0.42;
+        this.vy = Math.max(this.vy, 2.2);
+      }
+    } else if (horiz > 0.004) this.stuck = 0;
     this.playerBody.setNextKinematicTranslation(next);
     this.grounded = this.controller.computedGrounded();
-    const horiz = Math.hypot(m.x, m.z) / dt;
-    if (this.grounded && horiz > 0.8) {
+    const speed = horiz / dt;
+    if (this.grounded && speed > 0.8) {
       this.foot -= dt;
       if (this.foot <= 0) {
         this.foot = sprint ? 0.28 : 0.46;
@@ -770,34 +915,60 @@ export class Game {
   }
 
   private drainContacts(): void {
-    let budget = 4;
+    let budget = 6;
     this.queue.drainContactForceEvents((event) => {
-      if (budget <= 0) return;
-      const a = this.byHandle.get(event.collider1());
-      const b = this.byHandle.get(event.collider2());
-      const piece = a ?? b;
-      if (!piece || this.time < piece.nextClack) return;
-      if (event.totalForceMagnitude() < 40) return;
-      piece.nextClack = this.time + 0.16;
-      this.audio.shatter(piece.family, 0.45);
-      budget--;
+      const force = event.totalForceMagnitude();
+      const missile = this.missileByHandle.get(event.collider1()) ?? this.missileByHandle.get(event.collider2());
+      if (missile && !missile.exploded && force > (missile.kind === "meteor" ? 35 : 28)) {
+        this.afterStep.push(() => this.explodeMissile(missile));
+      }
+      const prop = this.propByHandle.get(event.collider1()) ?? this.propByHandle.get(event.collider2());
+      if (prop && prop.alive && force > 80) {
+        const vel = prop.body.linvel();
+        const speed = Math.hypot(vel.x, vel.y, vel.z);
+        if (prop.core && !prop.spent && speed > 4 && force > 140) this.armCore(prop, 0.05);
+        else if (prop.fragile && !prop.shard && speed > 6.5 && force > 280) this.shatterProp(prop);
+        else if (budget > 0 && speed > 1.2 && this.time >= prop.nextClack) {
+          prop.nextClack = this.time + 0.14;
+          this.audio.shatter(prop.family, 0.4);
+          budget--;
+        }
+      }
+      const piece = this.byHandle.get(event.collider1()) ?? this.byHandle.get(event.collider2());
+      if (piece && budget > 0 && this.time >= piece.nextClack && force > 40) {
+        piece.nextClack = this.time + 0.16;
+        this.audio.shatter(piece.family, 0.45);
+        budget--;
+      }
     });
     this.queue.drainCollisionEvents(() => undefined);
+  }
+
+  private syncBody(mesh: THREE.Object3D, body: RAPIER.RigidBody, cap: number): void {
+    const t = body.translation();
+    const r = body.rotation();
+    mesh.position.set(t.x, t.y, t.z);
+    mesh.quaternion.set(r.x, r.y, r.z, r.w);
+    const v = body.linvel();
+    const sp = Math.hypot(v.x, v.y, v.z);
+    if (sp > cap) {
+      const k = cap / sp;
+      body.setLinvel({ x: v.x * k, y: v.y * k, z: v.z * k }, true);
+    }
   }
 
   private syncMeshes(): void {
     for (const piece of this.pieces) {
       if (!piece.dynamic && !piece.spec.orbit) continue;
-      const t = piece.body.translation();
-      const r = piece.body.rotation();
-      piece.mesh.position.set(t.x, t.y, t.z);
-      piece.mesh.quaternion.set(r.x, r.y, r.z, r.w);
-      const v = piece.body.linvel();
-      const sp = Math.hypot(v.x, v.y, v.z);
-      if (sp > 26) {
-        const k = 26 / sp;
-        piece.body.setLinvel({ x: v.x * k, y: v.y * k, z: v.z * k }, true);
-      }
+      this.syncBody(piece.mesh, piece.body, 32);
+    }
+    for (const prop of this.props) {
+      if (!prop.alive || prop.removed) continue;
+      this.syncBody(prop.mesh, prop.body, 36);
+    }
+    for (const missile of this.missiles) {
+      if (missile.removed) continue;
+      this.syncBody(missile.mesh, missile.body, 48);
     }
   }
 
@@ -811,39 +982,61 @@ export class Game {
     if (!prompt) return;
     if (this.aimed && !readerOpen()) {
       const article = articleFor(this.aimed);
-      prompt.textContent = article ? `E  ·  ${article.title}` : "E  ·  Read";
+      prompt.textContent = article ? `X  ·  ${article.title}` : "X  ·  Read";
       prompt.classList.add("show");
     } else prompt.classList.remove("show");
   }
 
   private updatePowers(dt: number): void {
-    if (readerOpen()) {
+    if (readerOpen() || helpOpen() || creditsOpen()) {
       this.solarDown = false;
       this.fireEdge = false;
       this.audio.setBeam(false);
       this.beam.visible = false;
       return;
     }
-    if (this.power === 4 && this.solarDown && this.mode === "play") {
-      this.solarTick(dt);
-    } else {
-      this.audio.setBeam(false);
-      if (this.power === 4) this.beam.visible = false;
-    }
-    if (this.fireEdge && this.mode === "play" && this.cd[this.power] <= 0 && this.power !== 4) {
+    const armed = this.fireEdge && this.mode === "play" && this.cd[this.power] <= 0;
+    if (armed) {
       this.fireEdge = false;
       this.cast(this.power);
       this.cd[this.power] = POWERS[this.power].cd;
-    } else if (this.power === 4) {
-      this.fireEdge = false;
+    } else this.fireEdge = false;
+    if (this.power === 4 && this.solarDown && this.mode === "play") {
+      this.beamHold += dt;
+      this.audio.setBeam(true);
+      if (this.beamHold > 0.16) {
+        this.beamHold = 0;
+        this.fracture();
+      }
+    } else {
+      this.audio.setBeam(false);
+      this.beamHold = 0;
     }
-    if (!this.keys.has("KeyF") && this.power !== 4) this.solarDown = false;
   }
 
   private onPointerUp(e: PointerEvent): void {
+    if (e.button === 2) this.rightDown = false;
     if (e.button !== 0 || this.mode !== "play") return;
-    if (document.pointerLockElement === this.canvas) return;
+    const locked = document.pointerLockElement === this.canvas;
+    if (locked && !this.clickArmed) {
+      this.solarDown = false;
+      return;
+    }
+    if (!this.clickArmed) return;
+    this.clickArmed = false;
+    this.solarDown = false;
     if (this.pointer.moved) return;
+    const plaque = this.plaqueUnder(e);
+    if (plaque) {
+      this.openReader(plaque);
+      return;
+    }
+    this.fireEdge = true;
+    const req = this.canvas.requestPointerLock();
+    void Promise.resolve(req).catch(() => undefined);
+  }
+
+  private plaqueUnder(e: PointerEvent): string | null {
     const rect = this.canvas.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
@@ -851,24 +1044,16 @@ export class Game {
     );
     this.raycaster.setFromCamera(ndc, this.camera);
     const reads = this.raycaster.intersectObjects(this.aimables, false);
-    const read = reads.find((hit) => hit.distance < 9 && hit.object.userData.read);
-    if (read) {
-      this.openReader(String(read.object.userData.read));
-      return;
-    }
-    const grounds = this.raycaster.intersectObjects(this.built.grounds, false);
-    const ground = grounds[0];
-    if (!ground) return;
-    this.stroll = ground.point.clone();
-    this.marker.visible = true;
-    this.marker.position.set(ground.point.x, ground.point.y + 0.08, ground.point.z);
+    const read = reads.find((hit) => hit.distance < 9 && hit.object.userData.plaque);
+    return read ? String(read.object.userData.read) : null;
   }
 
   private cast(power: PowerId): void {
-    if (power === 1) this.lance();
+    if (power === 1) this.blast();
     else if (power === 2) this.singularity();
-    else if (power === 3) this.seismic();
-    else if (power === 5) this.differentiality();
+    else if (power === 3) this.differentiality();
+    else if (power === 4) this.fracture();
+    else this.launchMeteor();
   }
 
   private forward(): THREE.Vector3 {
@@ -877,7 +1062,7 @@ export class Game {
     return v.normalize();
   }
 
-  private rayHit(max = 40): { point: THREE.Vector3; piece: Piece | null } | null {
+  private rayHit(max = 40): { point: THREE.Vector3; piece: Piece | null; prop: LiveProp | null } | null {
     const dir = this.forward();
     const origin = this.camera.position.clone().addScaledVector(dir, 0.35);
     const ray = new RAPIER.Ray(origin, dir);
@@ -887,55 +1072,30 @@ export class Game {
     );
     if (!hit) return null;
     const point = origin.clone().addScaledVector(dir, hit.timeOfImpact);
-    return { point, piece: this.byHandle.get(hit.collider.handle) ?? null };
+    const prop = this.propByHandle.get(hit.collider.handle) ?? null;
+    return { point, piece: this.byHandle.get(hit.collider.handle) ?? null, prop: prop && prop.alive ? prop : null };
   }
 
-  private lance(): void {
+  private blast(): void {
     const dir = this.forward();
-    let ox = this.camera.position.x + dir.x * 0.4;
-    let oy = this.camera.position.y + dir.y * 0.4;
-    let oz = this.camera.position.z + dir.z * 0.4;
-    let remain = 34;
-    const skip = new Set<number>([this.playerCollider.handle, ...this.passThrough]);
-    const punched: Piece[] = [];
-    let end = new THREE.Vector3(ox + dir.x * 18, oy + dir.y * 18, oz + dir.z * 18);
-    for (let i = 0; i < 8 && remain > 0.2; i++) {
-      const ray = new RAPIER.Ray({ x: ox, y: oy, z: oz }, dir);
-      const hit = this.world.castRay(ray, remain, true, undefined, undefined, undefined, undefined, (c) => !skip.has(c.handle));
-      if (!hit) break;
-      const toi = hit.timeOfImpact;
-      const px = ox + dir.x * toi;
-      const py = oy + dir.y * toi;
-      const pz = oz + dir.z * toi;
-      end = new THREE.Vector3(px, py, pz);
-      const piece = this.byHandle.get(hit.collider.handle);
-      if (!piece) {
-        this.vfx.burst(end, "#d7c4a4", 10, 3, -2);
-        break;
-      }
-      punched.push(piece);
-      skip.add(hit.collider.handle);
-      this.kick(piece, dir.x * 16, dir.y * 4 + 2, dir.z * 16, 1);
-      this.splash(end, 1.1, piece, dir, 5);
-      this.vfx.burst(end, piece.family === "metal" ? "#ffe1a8" : "#ffb15a", 16, 6);
-      this.vfx.flash(end, "#ffd2a0", 10);
-      ox = px + dir.x * 0.2;
-      oy = py + dir.y * 0.2;
-      oz = pz + dir.z * 0.2;
-      remain -= toi + 0.2;
-    }
-    this.showBeam(this.camera.position.clone().addScaledVector(dir, 0.4), end, "#fff1d2", 0.07);
-    this.audio.shatter(punched[0]?.family ?? "metal", 0.9);
-    this.trauma = Math.max(this.trauma, 0.28);
+    const hit = this.rayHit(16);
+    const focus = hit ? hit.point : this.camera.position.clone().addScaledVector(dir, 6.5);
+    this.radialBlast(focus.x, focus.y, focus.z, 6.8, 14, 7, dir, false);
+    this.showBeam(this.camera.position.clone().addScaledVector(dir, 0.35), focus.clone().addScaledVector(dir, 1.2), "#fff1d2", 0.16);
+    this.vfx.shockwave(new THREE.Vector3(focus.x, 0.3, focus.z), "#ffb15a", 6.4);
+    this.vfx.burst(focus, "#ffe1a8", 26, 7);
+    this.vfx.flash(focus, "#ffd2a0", 14);
+    this.audio.boom();
+    this.trauma = Math.max(this.trauma, this.reduceMotion ? 0.1 : 0.42);
   }
 
   private singularity(): void {
-    const aim = this.aimPoint(8, 16);
+    const aim = this.aimPoint(6, 14);
     const group = new THREE.Group();
     group.position.copy(aim);
     for (let i = 0; i < 3; i++) {
       const ring = new THREE.Mesh(
-        new THREE.TorusGeometry(0.7 + i * 0.45, 0.035, 8, 32),
+        new THREE.TorusGeometry(0.7 + i * 0.5, 0.04, 8, 32),
         new THREE.MeshBasicMaterial({
           color: i === 1 ? "#2a2418" : "#e4b56a",
           transparent: true,
@@ -948,128 +1108,205 @@ export class Game {
       ring.rotation.x = i * 0.6;
       group.add(ring);
     }
-    const light = new THREE.PointLight("#e4b56a", 6, 12, 2);
+    const light = new THREE.PointLight("#e4b56a", 8, 16, 2);
     group.add(light);
     this.scene.add(group);
-    this.fields.push({ kind: "sing", x: aim.x, y: aim.y, z: aim.z, age: 0, boomed: false, group, light });
+    this.fields.push({
+      kind: "sing", x: aim.x, y: aim.y, z: aim.z, age: 0, boomed: false, dropped: false,
+      group, light, affected: [],
+    });
     this.audio.setHum(1);
-    this.trauma = Math.max(this.trauma, 0.2);
-  }
-
-  private seismic(): void {
-    const p = this.playerBody.translation();
-    const origin = new THREE.Vector3(p.x, 0.2, p.z);
-    for (const piece of this.pieces) {
-      const t = piece.body.translation();
-      const dx = t.x - p.x;
-      const dz = t.z - p.z;
-      const d = Math.hypot(dx, dz, t.y * 0.3);
-      if (d > 9.5) continue;
-      const fall = 1 - d / 9.5;
-      const len = Math.hypot(dx, dz) || 1;
-      this.kick(piece, (dx / len) * 10 * fall, 11 + 6 * fall, (dz / len) * 10 * fall, Math.max(0.7, fall));
-    }
-    this.vfx.shockwave(origin, "#ffb15a", 9);
-    this.vfx.burst(origin, "#c4b49a", 28, 5, -1);
-    this.vfx.flash(new THREE.Vector3(p.x, 1, p.z), "#ffb066", 16);
-    this.audio.boom();
-    let reached = 0;
-    for (const piece of this.pieces) {
-      const t = piece.body.translation();
-      if (Math.hypot(t.x - p.x, t.z - p.z) < 9.5) reached++;
-    }
-    if (reached === 0) this.toast("Step closer. The wave needs a sculpture.");
-    this.trauma = Math.max(this.trauma, this.reduceMotion ? 0 : 0.72);
-  }
-
-  private solarTick(dt: number): void {
-    const dir = this.forward();
-    const start = this.camera.position.clone().addScaledVector(dir, 0.45);
-    const hit = this.rayHit(28);
-    const end = hit ? hit.point : start.clone().addScaledVector(dir, 16);
-    this.showBeam(start, end, "#ff7a2a", 0.12, true);
-    this.beam.scale.x = 1.8;
-    this.beam.scale.z = 1.8;
-    this.audio.setBeam(true);
-    if (!hit?.piece) return;
-    this.addHeat(hit.piece, dt * 1.15);
-    const t = hit.piece.body.translation();
-    const pos = new THREE.Vector3(t.x, t.y, t.z);
-    for (const other of this.piecesNear(pos, 0.9)) {
-      if (other !== hit.piece) this.addHeat(other, dt * 0.35);
-    }
-    if (Math.random() < dt * 18) this.vfx.burst(end, "#ff8a3a", 4, 2, -1);
+    this.trauma = Math.max(this.trauma, 0.22);
   }
 
   private differentiality(): void {
-    const aim = this.aimPoint(5, 14);
+    const aim = this.aimPoint(4, 12);
     const group = new THREE.Group();
     group.position.copy(aim);
     const shell = new THREE.Mesh(
-      new THREE.IcosahedronGeometry(3.2, 1),
+      new THREE.IcosahedronGeometry(3.4, 1),
       new THREE.MeshBasicMaterial({
         color: "#9ff3d4",
         wireframe: true,
         transparent: true,
-        opacity: 0.45,
+        opacity: 0.5,
         toneMapped: false,
       }),
     );
     group.add(shell);
-    const light = new THREE.PointLight("#9ff3d4", 4, 10, 2);
+    const light = new THREE.PointLight("#9ff3d4", 6, 14, 2);
     group.add(light);
     this.scene.add(group);
-    this.fields.push({ kind: "invert", x: aim.x, y: aim.y, z: aim.z, age: 0, boomed: false, group, light });
-    for (const piece of this.piecesNear(aim, 6)) {
-      this.wake(piece);
-      piece.body.setGravityScale(-0.42, true);
-      const v = piece.body.linvel();
-      piece.body.setLinvel({ x: v.x * 0.4, y: Math.max(v.y, 0.4), z: v.z * 0.4 }, true);
-    }
+    const affected: Field["affected"] = [];
+    this.eachActorNear(aim.x, aim.y, aim.z, 6.4, (actor) => {
+      if (actor.prop?.core && !actor.prop.spent) {
+        this.armCore(actor.prop, 0.2);
+        return;
+      }
+      if (actor.piece) this.wake(actor.piece);
+      affected.push({ body: actor.body, gravity: actor.body.gravityScale() });
+      actor.body.setGravityScale(-1.15, true);
+      const v = actor.body.linvel();
+      actor.body.setLinvel({ x: v.x * 0.35, y: Math.max(v.y, 2.4), z: v.z * 0.35 }, true);
+      this.kicks++;
+    });
+    this.fields.push({
+      kind: "invert", x: aim.x, y: aim.y, z: aim.z, age: 0, boomed: false, dropped: false,
+      group, light, affected,
+    });
     this.audio.toneLift();
+    this.trauma = Math.max(this.trauma, 0.2);
+  }
+
+  private fracture(): void {
+    const dir = this.forward();
+    const start = this.camera.position.clone().addScaledVector(dir, 0.4);
+    const hit = this.rayHit(32);
+    const end = hit ? hit.point : start.clone().addScaledVector(dir, 14);
+    this.showBeam(start, end, "#fff6ea", 0.08, true);
+    if (hit?.piece) {
+      const t = hit.piece.body.translation();
+      this.fractureSculpture(hit.piece.sculptureId, new THREE.Vector3(t.x, t.y, t.z));
+      this.vfx.burst(end, "#f6f0e4", 18, 5);
+    } else if (hit?.prop) {
+      if (hit.prop.core) this.armCore(hit.prop, 0.02);
+      else if (hit.prop.fragile && !hit.prop.shard) this.shatterProp(hit.prop);
+      else this.shove(hit.prop.body, dir.x * 14, 5, dir.z * 14, undefined, hit.prop);
+      this.radialBlast(end.x, end.y, end.z, 2.6, 8, 3.5, dir, true);
+    } else {
+      this.radialBlast(end.x, end.y, end.z, 2.4, 7, 3, dir, true);
+    }
+    this.audio.shatter("stone", 0.8);
     this.trauma = Math.max(this.trauma, 0.18);
+  }
+
+  private fractureSculpture(id: string, origin: THREE.Vector3): void {
+    for (const piece of this.pieces) {
+      if (piece.sculptureId !== id) continue;
+      const t = piece.body.translation();
+      const dx = t.x - origin.x;
+      const dy = t.y - origin.y;
+      const dz = t.z - origin.z;
+      const dist = Math.hypot(dx, dy, dz) || 1;
+      this.shove(
+        piece.body,
+        (dx / dist) * 8 + (Math.random() - 0.5) * 2,
+        3.5 + Math.random() * 3,
+        (dz / dist) * 8 + (Math.random() - 0.5) * 2,
+        piece,
+      );
+    }
+  }
+
+  private launchMeteor(): void {
+    const aim = this.aimPoint(4, 12);
+    const dir = this.forward();
+    const start = new THREE.Vector3(aim.x - dir.x * 1.5, Math.max(8, aim.y + 15), aim.z - dir.z * 1.5);
+    const velocity = new THREE.Vector3(aim.x - start.x, aim.y - start.y, aim.z - start.z);
+    const len = velocity.length() || 1;
+    velocity.multiplyScalar(28 / len);
+    this.spawnMissile(start, velocity, 0.74, 80, "meteor", "obsidian");
+    this.audio.whoosh();
+    this.trauma = Math.max(this.trauma, 0.15);
+  }
+
+  private launchOrb(): void {
+    const dir = this.forward();
+    const start = this.camera.position.clone().addScaledVector(dir, 1.15);
+    this.spawnMissile(start, dir.multiplyScalar(23), 0.44, 60, "orb", "gold");
+    this.audio.whoosh();
+  }
+
+  private spawnMissile(
+    start: THREE.Vector3,
+    velocity: THREE.Vector3,
+    radius: number,
+    density: number,
+    kind: Missile["kind"],
+    mat: "obsidian" | "gold",
+  ): void {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 18, 14), this.mats.clone(mat));
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    const body = this.world.createRigidBody(
+      RAPIER.RigidBodyDesc.dynamic()
+        .setTranslation(start.x, start.y, start.z)
+        .setLinvel(velocity.x, velocity.y, velocity.z)
+        .setCanSleep(false)
+        .setCcdEnabled(true)
+        .setLinearDamping(0.04)
+        .setAngularDamping(0.08),
+    );
+    const collider = this.world.createCollider(
+      RAPIER.ColliderDesc.ball(radius).setDensity(density).setFriction(0.45).setRestitution(0.2),
+      body,
+    );
+    collider.setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS);
+    collider.setContactForceEventThreshold(kind === "meteor" ? 30 : 22);
+    const missile: Missile = { mesh, body, collider, kind, exploded: false, life: 0, removed: false };
+    this.missiles.push(missile);
+    this.missileByHandle.set(collider.handle, missile);
+    this.scene.add(mesh);
+  }
+
+  private explodeMissile(missile: Missile): void {
+    if (missile.exploded || missile.removed) return;
+    missile.exploded = true;
+    const t = missile.body.translation();
+    if (missile.kind === "meteor") {
+      this.radialBlast(t.x, t.y, t.z, 12.5, 18, 11, null, true);
+      this.vfx.shockwave(new THREE.Vector3(t.x, 0.35, t.z), "#ffb15a", 12);
+      this.vfx.burst(new THREE.Vector3(t.x, t.y, t.z), "#ffd7a0", 36, 9);
+      this.vfx.flash(new THREE.Vector3(t.x, t.y + 0.4, t.z), "#ffb066", 22);
+      this.audio.boom();
+      this.trauma = Math.max(this.trauma, this.reduceMotion ? 0.2 : 0.95);
+      this.destroyed++;
+    } else {
+      this.radialBlast(t.x, t.y, t.z, 3.4, 9, 4, null, false);
+      this.vfx.burst(new THREE.Vector3(t.x, t.y, t.z), "#e4b56a", 14, 5);
+      this.audio.shatter("metal", 0.7);
+      this.trauma = Math.max(this.trauma, 0.28);
+    }
   }
 
   private updateFields(dt: number): void {
     for (let i = this.fields.length - 1; i >= 0; i--) {
       const field = this.fields[i];
       field.age += dt;
-      field.group.rotation.y += dt * (field.kind === "sing" ? 2.4 : 0.6);
-      field.group.rotation.x += dt * 0.8;
+      field.group.rotation.y += dt * (field.kind === "sing" ? 2.6 : 0.7);
+      field.group.rotation.x += dt * 0.7;
       if (field.kind === "sing") {
-        const pull = field.age < 2.2;
-        for (const piece of this.piecesNear(new THREE.Vector3(field.x, field.y, field.z), 7.2)) {
-          const t = piece.body.translation();
+        const pull = field.age < 2.15;
+        this.eachActorNear(field.x, field.y, field.z, 7.6, (actor) => {
+          if (actor.prop?.core && !actor.prop.spent && field.age > 0.15) {
+            this.armCore(actor.prop, 0.08);
+            return;
+          }
+          const t = actor.body.translation();
           const dx = field.x - t.x;
-          const dy = field.y - t.y;
+          const dy = field.y + 0.4 - t.y;
           const dz = field.z - t.z;
           const dist = Math.hypot(dx, dy, dz) || 0.001;
-          this.wake(piece);
+          if (actor.piece) this.wake(actor.piece);
+          actor.body.wakeUp();
           if (pull) {
-            const v = piece.body.linvel();
-            const s = (1 - dist / 7.2) * 8;
+            const v = actor.body.linvel();
+            const s = (1 - dist / 7.6) * 11;
             const tx = -dz / dist;
             const tz = dx / dist;
-            piece.body.setLinvel({
-              x: v.x * 0.9 + (dx / dist) * s + tx * 2.2,
-              y: v.y * 0.9 + (dy / dist) * s * 0.65 + 0.3,
-              z: v.z * 0.9 + (dz / dist) * s + tz * 2.2,
+            actor.body.setLinvel({
+              x: v.x * 0.82 + (dx / dist) * s + tx * 4.2,
+              y: v.y * 0.82 + (dy / dist) * s * 0.85 + 1.6,
+              z: v.z * 0.82 + (dz / dist) * s + tz * 4.2,
             }, true);
+            this.kicks++;
           }
-        }
+        });
         if (!pull && !field.boomed) {
           field.boomed = true;
-          const at = new THREE.Vector3(field.x, field.y, field.z);
-          for (const piece of this.piecesNear(at, 7.5)) {
-            const t = piece.body.translation();
-            const dx = t.x - field.x;
-            const dy = t.y - field.y;
-            const dz = t.z - field.z;
-            const dist = Math.hypot(dx, dy, dz) || 1;
-            this.kick(piece, (dx / dist) * 12, 5 + dy / dist * 4, (dz / dist) * 12, 1);
-          }
-          this.vfx.shockwave(at, "#e4b56a", 7);
-          this.vfx.burst(at, "#ffd7a0", 30, 8);
+          this.radialBlast(field.x, field.y, field.z, 8, 13, 6, null, false);
+          this.vfx.shockwave(new THREE.Vector3(field.x, field.y, field.z), "#e4b56a", 7.5);
+          this.vfx.burst(new THREE.Vector3(field.x, field.y, field.z), "#ffd7a0", 28, 8);
           this.audio.boom();
           this.trauma = Math.max(this.trauma, 0.55);
           this.audio.setHum(0);
@@ -1079,58 +1316,126 @@ export class Game {
           this.fields.splice(i, 1);
           this.audio.setHum(0);
         }
-      } else if (field.age > 2.05 && !field.boomed) {
-        field.boomed = true;
-        for (const piece of this.piecesNear(new THREE.Vector3(field.x, field.y, field.z), 6.2)) {
-          piece.body.setGravityScale(2.8, true);
-          const v = piece.body.linvel();
-          piece.body.setLinvel({ x: v.x, y: Math.min(v.y, 0) - 3.5, z: v.z }, true);
+      } else if (!field.dropped && field.age > 1.65) {
+        field.dropped = true;
+        for (const entry of field.affected) {
+          entry.body.setGravityScale(2.7, true);
+          const v = entry.body.linvel();
+          entry.body.setLinvel({ x: v.x, y: Math.min(v.y, 0) - 4, z: v.z }, true);
         }
         this.audio.boom();
         this.trauma = Math.max(this.trauma, 0.4);
-      } else if (field.age > 2.7) {
-        for (const piece of this.pieces) piece.body.setGravityScale(1, true);
+      } else if (field.age > 2.55) {
+        for (const entry of field.affected) entry.body.setGravityScale(entry.gravity, true);
         this.scene.remove(field.group);
         this.fields.splice(i, 1);
       }
     }
   }
 
-  private updateHeat(dt: number): void {
+  private eachActorNear(x: number, y: number, z: number, radius: number, fn: (actor: Actor) => void): number {
+    const r2 = radius * radius;
+    let n = 0;
+    const take = (px: number, py: number, pz: number) => {
+      const dx = px - x;
+      const dy = py - y;
+      const dz = pz - z;
+      return dx * dx + dy * dy + dz * dz <= r2;
+    };
     for (const piece of this.pieces) {
-      if (piece.heat <= 0) continue;
-      if (!piece.hot) piece.heat = Math.max(0, piece.heat - dt * 0.12);
-      else piece.heat = Math.max(0.55, piece.heat - dt * 0.05);
-      const k = Math.min(1, piece.heat);
-      piece.mat.emissive.r = piece.baseEmissive.r + (1 - piece.baseEmissive.r) * k;
-      piece.mat.emissive.g = piece.baseEmissive.g * (1 - k) + 0.28 * k;
-      piece.mat.emissive.b = piece.baseEmissive.b * (1 - k * 0.85);
-      piece.mat.emissiveIntensity = piece.baseEm + k * 2.4;
+      const t = piece.body.translation();
+      if (!take(t.x, t.y, t.z)) continue;
+      fn({ body: piece.body, piece });
+      n++;
     }
+    for (const prop of this.props) {
+      if (!prop.alive || prop.removed) continue;
+      const t = prop.body.translation();
+      if (!take(t.x, t.y, t.z)) continue;
+      fn({ body: prop.body, prop });
+      n++;
+    }
+    for (const missile of this.missiles) {
+      if (missile.removed) continue;
+      const t = missile.body.translation();
+      if (!take(t.x, t.y, t.z)) continue;
+      fn({ body: missile.body });
+      n++;
+    }
+    return n;
   }
 
-  private addHeat(piece: Piece, amount: number): void {
-    piece.heat += amount;
-    if (piece.heat >= 1 && !piece.hot) this.detonate(piece, 0);
+  private radialBlast(
+    x: number, y: number, z: number,
+    radius: number, speed: number, lift: number,
+    dir: THREE.Vector3 | null,
+    shatterFragile: boolean,
+  ): number {
+    let n = 0;
+    this.eachActorNear(x, y, z, radius, (actor) => {
+      const t = actor.body.translation();
+      const dx = t.x - x;
+      const dy = t.y - y;
+      const dz = t.z - z;
+      const dist = Math.hypot(dx, dy, dz) || 0.001;
+      const fall = Math.max(0, 1 - dist / radius);
+      if (actor.prop?.core && !actor.prop.spent) {
+        this.armCore(actor.prop, 0.04 + (1 - fall) * 0.18);
+        n++;
+        return;
+      }
+      if (shatterFragile && actor.prop?.fragile && !actor.prop.shard) {
+        this.shatterProp(actor.prop);
+        n++;
+        return;
+      }
+      const nx = dx / dist;
+      const nz = dz / dist;
+      const bias = dir ? 0.75 : 0;
+      this.shove(
+        actor.body,
+        (nx * speed + (dir ? dir.x * speed * bias : 0)) * (0.4 + fall),
+        lift * (0.45 + fall) + Math.max(0, dy / dist) * 2,
+        (nz * speed + (dir ? dir.z * speed * bias : 0)) * (0.4 + fall),
+        actor.piece,
+        actor.prop,
+      );
+      n++;
+    });
+    return n;
   }
 
-  private detonate(piece: Piece, depth: number): void {
-    if (piece.hot || depth > 10) {
-      piece.hot = true;
-      return;
+  private shove(
+    body: RAPIER.RigidBody,
+    vx: number, vy: number, vz: number,
+    piece?: Piece,
+    prop?: LiveProp,
+  ): void {
+    if (piece) this.wake(piece);
+    if (prop) {
+      if (!prop.alive || prop.removed) return;
+      if (prop.core && !prop.spent) {
+        this.armCore(prop, 0.03);
+        return;
+      }
+      prop.body.wakeUp();
+      if (prop.gravityScale < 0.25) prop.body.setGravityScale(0.4, true);
     }
-    piece.hot = true;
-    piece.heat = 1;
-    const t = piece.body.translation();
-    const pos = new THREE.Vector3(t.x, t.y, t.z);
-    this.kick(piece, (Math.random() - 0.5) * 8, 4 + Math.random() * 3, (Math.random() - 0.5) * 8, 0.8);
-    this.vfx.burst(pos, "#ff6a1a", 12, 4);
-    this.audio.shatter(piece.family, 0.7);
-    for (const other of this.piecesNear(pos, 1.45)) {
-      if (other === piece || other.hot) continue;
-      other.heat += 0.55;
-      if (other.heat >= 1) this.detonate(other, depth + 1);
-    }
+    body.wakeUp();
+    const mass = body.mass();
+    const heft = mass > 90 ? 0.4 : mass > 40 ? 0.68 : 1;
+    const v = body.linvel();
+    body.setLinvel({
+      x: v.x * 0.35 + vx * heft,
+      y: v.y * 0.35 + vy * heft,
+      z: v.z * 0.35 + vz * heft,
+    }, true);
+    body.applyTorqueImpulse({
+      x: (Math.random() - 0.5) * 4.5,
+      y: (Math.random() - 0.5) * 4.5,
+      z: (Math.random() - 0.5) * 4.5,
+    }, true);
+    this.kicks++;
   }
 
   private aimPoint(minDist: number, fallback: number): THREE.Vector3 {
@@ -1144,19 +1449,6 @@ export class Game {
     return p;
   }
 
-  private piecesNear(pos: THREE.Vector3, radius: number): Piece[] {
-    const r2 = radius * radius;
-    const out: Piece[] = [];
-    for (const piece of this.pieces) {
-      const t = piece.body.translation();
-      const dx = t.x - pos.x;
-      const dy = t.y - pos.y;
-      const dz = t.z - pos.z;
-      if (dx * dx + dy * dy + dz * dz <= r2) out.push(piece);
-    }
-    return out;
-  }
-
   private wake(piece: Piece): void {
     if (piece.dynamic) return;
     piece.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
@@ -1166,28 +1458,8 @@ export class Game {
     const work = this.works.find((w) => w.def.id === piece.sculptureId);
     if (work && work.intact) {
       work.intact = false;
+      this.destroyed++;
       for (const hoop of work.hoops) hoop.visible = false;
-    }
-  }
-
-  private kick(piece: Piece, vx: number, vy: number, vz: number, heftScale: number): void {
-    this.wake(piece);
-    const mass = piece.body.mass();
-    const heft = mass > 50 ? 0.5 : mass > 20 ? 0.75 : 1;
-    const k = heft * heftScale;
-    const v = piece.body.linvel();
-    piece.body.setLinvel({ x: v.x + vx * k, y: v.y + vy * k, z: v.z + vz * k }, true);
-    piece.body.applyTorqueImpulse({
-      x: (Math.random() - 0.5) * 3.5,
-      y: (Math.random() - 0.5) * 3.5,
-      z: (Math.random() - 0.5) * 3.5,
-    }, true);
-  }
-
-  private splash(pos: THREE.Vector3, radius: number, ignore: Piece, dir: THREE.Vector3, speed: number): void {
-    for (const piece of this.piecesNear(pos, radius)) {
-      if (piece === ignore) continue;
-      this.kick(piece, dir.x * speed + (Math.random() - 0.5) * 3, 2, dir.z * speed + (Math.random() - 0.5) * 3, 0.65);
     }
   }
 
@@ -1205,15 +1477,18 @@ export class Game {
 
   private restoreAimed(): void {
     const id = this.aimed ?? this.nearestDamaged();
-    if (!id || id === "bust" || id === "guardian") {
-      this.toast("Face a campus sculpture, or restore the whole terrace.");
-      return;
-    }
-    this.restoreIds([id]);
+    if (id && id !== "bust" && id !== "guardian") this.restoreIds([id]);
+    this.rebuildProps();
+    this.toast(id && id !== "bust" && id !== "guardian" ? "Restored, and the props are set again." : "The props are set again.");
   }
 
   private restoreAll(): void {
     this.restoreIds(this.works.map((w) => w.def.id));
+    this.rebuildProps();
+    this.clearFields();
+    this.destroyed = 0;
+    this.kicks = 0;
+    this.toast("The campus is whole again.");
   }
 
   private nearestAhead(): string | null {
@@ -1274,7 +1549,6 @@ export class Game {
       for (const hoop of work.hoops) hoop.visible = true;
     }
     this.audio.restore();
-    this.toast(ids.length > 1 ? "The campus is whole again." : "Restored.");
   }
 
   private readAimed(): void {
@@ -1349,6 +1623,285 @@ export class Game {
     window.setTimeout(() => node.classList.remove("show"), 2200);
   }
 
+  private rebuildProps(): void {
+    this.clearDynamics();
+    for (const spec of campusProps()) this.spawnProp(spec, false);
+  }
+
+  private clearDynamics(): void {
+    for (const prop of this.props) {
+      if (prop.joint) this.world.removeImpulseJoint(prop.joint, false);
+      if (!prop.removed) this.world.removeRigidBody(prop.body);
+      if (prop.pivot) this.world.removeRigidBody(prop.pivot);
+      this.scene.remove(prop.mesh);
+      prop.mesh.geometry.dispose();
+      prop.removed = true;
+      prop.alive = false;
+    }
+    for (const missile of this.missiles) {
+      if (!missile.removed) this.world.removeRigidBody(missile.body);
+      this.scene.remove(missile.mesh);
+      missile.mesh.geometry.dispose();
+      missile.removed = true;
+    }
+    this.props = [];
+    this.propByHandle.clear();
+    this.missiles = [];
+    this.missileByHandle.clear();
+    this.shardCount = 0;
+    this.afterStep = [];
+  }
+
+  private clearFields(): void {
+    for (const field of this.fields) this.scene.remove(field.group);
+    this.fields = [];
+    this.audio.setHum(0);
+    this.audio.setBeam(false);
+    this.beam.visible = false;
+  }
+
+  private spawnProp(spec: PropSpec, shard: boolean): LiveProp | null {
+    const mesh = new THREE.Mesh(geometryFor(spec), this.mats.templates[spec.mat]);
+    mesh.castShadow = false;
+    mesh.receiveShadow = !shard;
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(spec.rot?.[0] ?? 0, spec.rot?.[1] ?? 0, spec.rot?.[2] ?? 0, "XYZ"));
+    const body = this.world.createRigidBody(
+      RAPIER.RigidBodyDesc.dynamic()
+        .setTranslation(spec.pos[0], spec.pos[1], spec.pos[2])
+        .setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
+        .setGravityScale(spec.gravityScale)
+        .setLinearDamping(spec.damping)
+        .setAngularDamping(spec.adamping)
+        .setCanSleep(spec.canSleep)
+        .setCcdEnabled(spec.ccd),
+    );
+    const collider = this.world.createCollider(
+      colliderFor(spec).setDensity(spec.density).setFriction(spec.friction).setRestitution(spec.restitution),
+      body,
+    );
+    collider.setActiveEvents(RAPIER.ActiveEvents.CONTACT_FORCE_EVENTS);
+    collider.setContactForceEventThreshold(spec.fragile || spec.core ? 40 : 80);
+    let pivot: RAPIER.RigidBody | null = null;
+    let joint: RAPIER.ImpulseJoint | null = null;
+    if (spec.pendulum) {
+      const [px, py, pz] = spec.pendulum;
+      pivot = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(px, py, pz));
+      joint = this.world.createImpulseJoint(
+        RAPIER.JointData.spherical(
+          { x: 0, y: 0, z: 0 },
+          { x: px - spec.pos[0], y: py - spec.pos[1], z: pz - spec.pos[2] },
+        ),
+        pivot,
+        body,
+        true,
+      );
+      body.setLinvel({ x: 1.6, y: 0, z: 0.45 }, true);
+    }
+    const light: THREE.PointLight | null = null;
+    mesh.position.set(spec.pos[0], spec.pos[1], spec.pos[2]);
+    mesh.quaternion.copy(q);
+    this.scene.add(mesh);
+    const prop: LiveProp = {
+      spec, mesh, body, collider, pivot, joint, light,
+      fragile: spec.fragile,
+      core: spec.core,
+      shard,
+      alive: true,
+      spent: false,
+      removed: false,
+      fuse: 0,
+      family: soundFamily(spec.mat),
+      gravityScale: spec.gravityScale,
+      nextClack: 0,
+    };
+    this.props.push(prop);
+    this.propByHandle.set(collider.handle, prop);
+    if (shard) this.shardCount++;
+    return prop;
+  }
+
+  private shatterProp(prop: LiveProp): void {
+    if (!prop.alive || prop.removed || prop.shard) return;
+    prop.alive = false;
+    prop.spent = true;
+    const t = prop.body.translation();
+    const pos = new THREE.Vector3(t.x, t.y, t.z);
+    const mat = prop.spec.mat;
+    const family = prop.family;
+    this.afterStep.push(() => {
+      this.removeProp(prop);
+      this.spawnShards(pos, mat);
+      this.destroyed++;
+      this.vfx.burst(pos, family === "wood" ? "#c4a574" : "#f4efe4", 14, 4.5);
+      this.audio.shatter(family, 0.75);
+    });
+  }
+
+  private spawnShards(pos: THREE.Vector3, mat: PropSpec["mat"]): void {
+    const count = 5;
+    if (this.shardCount > 140) return;
+    for (let i = 0; i < count; i++) {
+      const ang = (i / count) * Math.PI * 2;
+      const spec: PropSpec = {
+        shape: "box",
+        mat,
+        pos: [pos.x + Math.cos(ang) * 0.18, pos.y + 0.12 + (i % 2) * 0.08, pos.z + Math.sin(ang) * 0.18],
+        size: [0.16 + (i % 3) * 0.04, 0.1, 0.14],
+        rot: [i, ang, i * 0.4],
+        density: 10,
+        restitution: 0.2,
+        friction: 0.5,
+        fragile: false,
+        core: false,
+        gravityScale: 1,
+        ccd: true,
+        pendulum: null,
+        damping: 0.15,
+        adamping: 0.25,
+        canSleep: true,
+        tag: "shard",
+        castShadow: false,
+      };
+      const prop = this.spawnProp(spec, true);
+      prop?.body.setLinvel({
+        x: Math.cos(ang) * (4 + i),
+        y: 3 + Math.random() * 3,
+        z: Math.sin(ang) * (4 + i),
+      }, true);
+    }
+  }
+
+  private removeProp(prop: LiveProp): void {
+    if (prop.removed) return;
+    prop.removed = true;
+    prop.alive = false;
+    this.propByHandle.delete(prop.collider.handle);
+    if (prop.joint) this.world.removeImpulseJoint(prop.joint, true);
+    prop.joint = null;
+    this.world.removeRigidBody(prop.body);
+    if (prop.pivot) this.world.removeRigidBody(prop.pivot);
+    prop.pivot = null;
+    this.scene.remove(prop.mesh);
+    prop.mesh.geometry.dispose();
+    if (prop.shard) this.shardCount = Math.max(0, this.shardCount - 1);
+  }
+
+  private armCore(prop: LiveProp, delay: number): void {
+    if (!prop.core || prop.spent || !prop.alive) return;
+    prop.spent = true;
+    prop.fuse = Math.max(0.02, delay);
+  }
+
+  private updateFuses(dt: number): void {
+    for (const prop of this.props) {
+      if (!prop.alive || !prop.spent || prop.fuse <= 0) continue;
+      prop.fuse -= dt;
+      if (prop.fuse <= 0) {
+        prop.fuse = 0;
+        this.detonateCore(prop);
+      }
+    }
+    for (const missile of this.missiles) {
+      if (missile.removed || missile.exploded) continue;
+      missile.life += dt;
+      if (missile.kind === "meteor" && missile.life > 2.4) this.explodeMissile(missile);
+    }
+  }
+
+  private detonateCore(prop: LiveProp): void {
+    if (!prop.alive || prop.removed) return;
+    const t = prop.body.translation();
+    const pos = new THREE.Vector3(t.x, t.y, t.z);
+    prop.alive = false;
+    this.afterStep.push(() => {
+      this.removeProp(prop);
+      this.radialBlast(pos.x, pos.y, pos.z, 7.4, 15, 9, null, true);
+      this.vfx.shockwave(new THREE.Vector3(pos.x, 0.4, pos.z), "#ffb15a", 7.2);
+      this.vfx.burst(pos, "#ffd2a0", 30, 8);
+      this.vfx.flash(pos, "#ffb066", 18);
+      this.audio.boom();
+      this.trauma = Math.max(this.trauma, this.reduceMotion ? 0.15 : 0.7);
+      this.destroyed++;
+      for (const other of this.props) {
+        if (!other.alive || !other.core || other.spent) continue;
+        const o = other.body.translation();
+        if (Math.hypot(o.x - pos.x, o.y - pos.y, o.z - pos.z) < 7.6) this.armCore(other, 0.16);
+      }
+    });
+  }
+
+  private flushAfterStep(): void {
+    if (this.afterStep.length === 0) return;
+    const jobs = this.afterStep;
+    this.afterStep = [];
+    for (const job of jobs) job();
+  }
+
+  private toggleLowG(): void {
+    this.lowG = !this.lowG;
+    this.world.gravity = { x: 0, y: this.lowG ? -1.9 : -12.5, z: 0 };
+    this.paintSandbox();
+    this.toast(this.lowG ? "Lunar gravity. The campus exhales." : "Gravity restored.");
+  }
+
+  private toggleSlow(): void {
+    this.slow = !this.slow;
+    this.timeScale = this.slow ? 0.25 : 1;
+    this.paintSandbox();
+    this.toast(this.slow ? "Bullet time. A quarter speed." : "Time restored.");
+  }
+
+  private paintSandbox(): void {
+    document.getElementById("flag-lowg")?.classList.toggle("on", this.lowG);
+    document.getElementById("flag-slow")?.classList.toggle("on", this.slow);
+    const bodies = document.getElementById("stat-bodies");
+    const broke = document.getElementById("stat-broke");
+    if (bodies) bodies.textContent = `${this.countAwake()} active`;
+    if (broke) broke.textContent = `${this.destroyed} broken`;
+  }
+
+  private countAwake(): number {
+    let n = 0;
+    for (const piece of this.pieces) if (piece.dynamic && !piece.body.isSleeping()) n++;
+    for (const prop of this.props) if (prop.alive && !prop.removed && !prop.body.isSleeping()) n++;
+    for (const missile of this.missiles) if (!missile.removed && !missile.body.isSleeping()) n++;
+    return n;
+  }
+
+  private paintProbe(): void {
+    const node = document.getElementById("probe");
+    if (!node) return;
+    const p = this.playerBody.translation();
+    let sx = 0;
+    let sz = 0;
+    let n = 0;
+    for (const prop of this.props) {
+      if (!prop.alive || prop.removed) continue;
+      const t = prop.body.translation();
+      sx += t.x;
+      sz += t.z;
+      n++;
+    }
+    for (const piece of this.pieces) {
+      if (!piece.dynamic) continue;
+      const t = piece.body.translation();
+      sx += t.x;
+      sz += t.z;
+      n++;
+    }
+    node.dataset.x = p.x.toFixed(3);
+    node.dataset.y = p.y.toFixed(3);
+    node.dataset.z = p.z.toFixed(3);
+    node.dataset.kicks = String(this.kicks);
+    node.dataset.broken = String(this.destroyed);
+    node.dataset.awake = String(this.countAwake());
+    node.dataset.sig = `${n}:${sx.toFixed(1)}:${sz.toFixed(1)}`;
+    node.dataset.mode = this.mode;
+    node.dataset.ground = this.grounded ? "1" : "0";
+    node.dataset.stuck = String(this.stuck);
+    node.dataset.steps = String(this.physSteps);
+  }
+
   private placeCamera(): void {
     const p = this.playerBody.translation();
     this.camera.position.set(p.x, p.y + 0.68, p.z);
@@ -1390,6 +1943,21 @@ export class Game {
     this.scene.traverse((obj) => {
       if (obj.userData.bob) obj.position.y = 0.48 + Math.sin(this.time * 2 + Number(obj.userData.bob)) * 0.05;
     });
+    const motes = this.built.motes;
+    const base = motes.userData.moteBase as Float32Array | undefined;
+    if (base) {
+      const attr = motes.geometry.getAttribute("position") as THREE.BufferAttribute;
+      for (let i = 0; i < base.length / 3; i++) {
+        const a = this.time * 0.35 + i * 0.7;
+        attr.setXYZ(
+          i,
+          base[i * 3] + Math.sin(a) * 0.55,
+          base[i * 3 + 1] + Math.sin(a * 0.8 + i) * 0.28,
+          base[i * 3 + 2] + Math.cos(a * 0.9) * 0.55,
+        );
+      }
+      attr.needsUpdate = true;
+    }
     if (this.stroll && this.marker.visible) this.marker.rotation.z += dt;
     const bodyPos = this.playerBody.translation();
     const wing = nearestWing(bodyPos.x, bodyPos.z);
@@ -1450,6 +2018,9 @@ function readerOpen(): boolean {
 }
 function helpOpen(): boolean {
   return document.getElementById("help")?.classList.contains("open") ?? false;
+}
+function creditsOpen(): boolean {
+  return document.getElementById("credits")?.classList.contains("open") ?? false;
 }
 
 function geometryFor(spec: PieceSpec): THREE.BufferGeometry {

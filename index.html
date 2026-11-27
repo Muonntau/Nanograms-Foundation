@@ -12,7 +12,7 @@
     <script type="module" src="/src/main.ts"></script>
   </head>
   <body>
-    <canvas id="view"></canvas>
+    <canvas id="view" tabindex="0"></canvas>
     <div id="fade"></div>
     <div id="loader">
       <p class="brand">Nanograms Foundation</p>
@@ -50,11 +50,11 @@
         <p id="power-line">A clean question, asked at speed.</p>
       </div>
       <div id="powers" role="toolbar" aria-label="Powers">
-        <button type="button" data-power="1"><b>1</b><span>Lance</span><i></i></button>
-        <button type="button" data-power="2"><b>2</b><span>Singularity</span><i></i></button>
-        <button type="button" data-power="3"><b>3</b><span>Shockwave</span><i></i></button>
-        <button type="button" data-power="4"><b>4</b><span>Ember</span><i></i></button>
-        <button type="button" data-power="5"><b>5</b><span>1/E</span><i></i></button>
+        <button type="button" data-power="1"><b>1</b><span>Blast</span><i></i></button>
+        <button type="button" data-power="2"><b>2</b><span>Well</span><i></i></button>
+        <button type="button" data-power="3"><b>3</b><span>1/E</span><i></i></button>
+        <button type="button" data-power="4"><b>4</b><span>Shatter</span><i></i></button>
+        <button type="button" data-power="5"><b>5</b><span>Meteor</span><i></i></button>
       </div>
       <div class="actions">
         <button type="button" id="btn-cast">Cast</button>
@@ -67,7 +67,15 @@
         <button type="button" id="btn-help">Help</button>
         <span id="fps">—</span>
       </div>
+      <p id="sandbox-line">
+        <span id="flag-lowg" class="flag">Low-G</span>
+        <span id="flag-slow" class="flag">Slow-Mo</span>
+        <span id="stat-bodies">0 active</span>
+        <span id="stat-broke">0 broken</span>
+        <span id="controls-hint">WASD / arrows move · Q E turn · drag looks · Shift sprint · Space jump · 1–5 click cast · F orb · G low-g · T slow · R restore</span>
+      </p>
     </footer>
+    <div id="probe" hidden></div>
 
     <aside id="reader" aria-label="Plaque">
       <p id="reader-kicker" class="eyebrow"></p>
@@ -82,11 +90,11 @@
       <p class="eyebrow">How to be here</p>
       <h2>Walk, read, break, restore.</h2>
       <ul>
-        <li><b>WASD</b> walk. <b>Shift</b> sprint. <b>Space</b> jump.</li>
-        <li><b>Look</b> captures the mouse. <b>Esc</b> gives it back. Hold the right mouse button to turn without capturing it. Arrow keys turn as well.</li>
-        <li>Click the ground to stroll. Click a plaque, or press <b>E</b>, to read.</li>
-        <li><b>1–5</b> choose an instrument. <b>Cast</b>, <b>F</b>, or a locked click fires it. Hold for the ember beam.</li>
-        <li><b>R</b> restores the sculpture in front of you. <b>Shift+R</b> restores the campus.</li>
+        <li><b>WASD</b> and the <b>arrow keys</b> walk, with or without the mouse captured. <b>Shift</b> sprints. <b>Space</b> jumps.</li>
+        <li><b>Q</b> and <b>E</b> turn. Drag the mouse to look. Click the view to capture the mouse. <b>Esc</b> releases it and leaves walking intact.</li>
+        <li>Click a plaque, or press <b>X</b>, to read. Click anywhere else to cast.</li>
+        <li><b>1–5</b> choose an instrument, then click or press <b>Cast</b>. <b>F</b> throws a wrecking orb. <b>G</b> lunar gravity. <b>T</b> bullet time.</li>
+        <li><b>R</b> restores the sculpture in front of you and the nearby props. <b>Shift+R</b> rebuilds the campus.</li>
         <li>The bar above is the site map. It will carry you to any wing.</li>
       </ul>
       <p class="note">The powers are for the monuments, which were built to come apart. The marble study and the concrete cat are guests.</p>
@@ -110,7 +118,7 @@
           <button type="button" id="btn-enter">Enter &amp; look</button>
           <button type="button" id="btn-stroll" class="ghost">Stroll with a free cursor</button>
         </div>
-        <p class="fine"><span id="intro-count">22</span> sculptures · five instruments · restore is a right</p>
+        <p class="fine"><span id="intro-count">22</span> sculptures · five instruments · a physics sandbox · restore is a right</p>
       </div>
     </section>
 

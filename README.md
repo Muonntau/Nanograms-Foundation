@@ -35,25 +35,28 @@ In the repository settings, set **Pages → Build and deployment → Source** to
 
 | Action | Input |
 | --- | --- |
-| Walk / sprint / jump | WASD, Shift, Space |
-| Look | Look button (pointer lock), right-drag, or arrow keys |
-| Stroll | Click the ground |
-| Read a plaque | Click it, or aim and press E |
-| Powers | 1–5, then Cast, F, or a click while looking |
-| Ember beam | Hold Cast, F, or the locked mouse button |
-| Restore one / all | R, or Shift+R. Buttons do the same |
-| Cursor back, panels closed | Esc |
+| Walk / sprint / jump | WASD or arrow keys, Shift, Space. Works without pointer lock |
+| Turn | Q and E. Drag the mouse to look. Click the view to capture the mouse |
+| Read a plaque | Click the plaque, or aim and press X |
+| Powers | 1–5, then click or Cast |
+| Wrecking orb | F |
+| Lunar gravity | G |
+| Bullet time | T (physics at 0.25×) |
+| Restore one / all | R restores the sculpture ahead and resets props. Shift+R rebuilds the campus |
+| Cursor back, panels closed | Esc. Walking keeps working |
 | Mute | M |
 
 The top bar is the site map. It carries you to a wing without the walk.
 
 ## Powers
 
-1. **Kinetic Lance** — a fast beam that punches through a sculpture and throws the shards.
-2. **Gravity Singularity** — a dark-gold vortex that draws pieces into orbit, then throws them out.
-3. **Seismic Shockwave** — a ground wave that heaves nearby monuments upward.
-4. **Solar Ember Beam** — sustained heat that cracks a form and can chain to its neighbors.
-5. **Differentiality Pulse** — a mint field where gravity loosens, then slams back. A game feeling, not a result. The plaque says so.
+1. **Kinetic Force Blast** — a directional shockwave that impulses every rigid body in front of you.
+2. **Singularity** — a gravity well that lifts, orbits, and then flings nearby bodies.
+3. **Differentiality Inversion** — `z = 1/E`. A local anti-gravity field floats objects, then drops them.
+4. **Fracture Beam** — shatters a sculpture into live pieces and breaks fragile props into shards.
+5. **Orbital Slam** — a physical meteor and a wide shockwave. Resonance cores chain-detonate.
+
+Every wing holds stacks, dominos, urns, spheres, pendulums, and cores. They sleep until a power, a wrecking orb, or the player bumps them.
 
 ## Credits
 
